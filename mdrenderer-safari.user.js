@@ -1,16 +1,14 @@
 // ==UserScript==
-// @name         Markdown Renderer
+// @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.7.0
-// @description  Render URLs ending in .md as HTML with MathJax SVG math and CSP-resistant images.
+// @version      0.8.1
+// @description  Render URLs ending in .md as HTML with MathJax SVG math. Safari/iPad optimized — images are rendered directly via <img> tags.
 // @author       you
 // @match        http://*/*.md*
 // @match        https://*/*.md*
 // @include      /^https?:\/\/.*\.md(?:[?#].*)?$/
 // @run-at       document-idle
 // @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
-// @connect      *
 // @require      https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.2.5/dist/purify.min.js
 // @require      https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg-full.js
@@ -29,20 +27,9 @@
 
     // $...$ をインライン数式として扱う。
     enableSingleDollarInlineMath: true,
-
-    // arXiv などの透明PNG対策。
-    imageCanvasBackground: '#ffffff',
   };
 
-  const mdRendererObjectUrls = [];
-
   if (!CONFIG.markdownUrlPattern.test(location.href)) return;
-
-  window.addEventListener('pagehide', () => {
-    for (const url of mdRendererObjectUrls) {
-      URL.revokeObjectURL(url);
-    }
-  });
 
   function hasRequiredLibraries() {
     return (
@@ -268,8 +255,8 @@
         background: color-mix(in srgb, CanvasText 18%, transparent);
       }
 
-      .md-renderer-blob-image,
-      .md-renderer-canvas-image {
+      /* Safari 版: 画像は直接 <img> で表示 */
+      .md-renderer-content img {
         display: block;
         max-width: 100%;
         height: auto;
@@ -277,34 +264,7 @@
         background: #fff;
         box-sizing: border-box;
         border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
-      }
-
-      .md-renderer-image-figure {
-        display: block;
         margin: 1.2em 0;
-        max-width: 100%;
-        overflow-x: auto;
-      }
-
-      .md-renderer-image-figure a {
-        display: inline-block;
-        max-width: 100%;
-      }
-
-      .md-renderer-image-figure figcaption {
-        margin-top: 0.5em;
-        color: color-mix(in srgb, CanvasText 68%, transparent);
-        font-size: 0.92em;
-        line-height: 1.45;
-      }
-
-      .md-renderer-image-placeholder {
-        padding: 12px 14px;
-        border: 1px dashed color-mix(in srgb, CanvasText 28%, transparent);
-        border-radius: 8px;
-        color: color-mix(in srgb, CanvasText 72%, transparent);
-        background: color-mix(in srgb, CanvasText 5%, transparent);
-        font-size: 14px;
       }
 
       .md-renderer-raw {
@@ -366,50 +326,22 @@
   }
 
   function configureMarked() {
-    const renderer = new window.marked.Renderer();
-
-    renderer.image = function imageRenderer(hrefOrToken, titleArg, textArg) {
-      let href = '';
-      let title = '';
-      let text = '';
-
-      // marked v15 形式: renderer.image(token)
-      if (
-        hrefOrToken &&
-        typeof hrefOrToken === 'object' &&
-        Object.prototype.hasOwnProperty.call(hrefOrToken, 'href')
-      ) {
-        href = hrefOrToken.href || '';
-        title = hrefOrToken.title || '';
-        text = hrefOrToken.text || '';
-      } else {
-        // 旧形式互換: renderer.image(href, title, text)
-        href = hrefOrToken || '';
-        title = titleArg || '';
-        text = textArg || '';
-      }
-
-      // <img src="https://..."> をここで作らない。
-      // CSP の img-src に当たらないよう、後段で GM_xmlhttpRequest + blob/canvas に変換する。
-      return `
-        <span
-          class="md-renderer-image-request"
-          data-md-image-src="${escapeHtml(href)}"
-          data-md-image-alt="${escapeHtml(text)}"
-          data-md-image-title="${escapeHtml(title)}"
-        ></span>
-      `;
-    };
-
+    /**
+     * marked の設定。Safari 版では renderer.image をカスタマイズせず、
+     * デフォルトの <img> タグをそのまま出力させる。
+     */
     window.marked.setOptions({
       gfm: true,
       breaks: CONFIG.breaks,
       async: false,
-      renderer,
     });
   }
 
   function sanitizeHtml(html) {
+    /**
+     * Safari 版: <img> を許可し、src / alt / loading 属性を通す。
+     * CSP プロキシ処理は行わないため、画像は直接表示される。
+     */
     return window.DOMPurify.sanitize(html, {
       USE_PROFILES: {
         html: true,
@@ -419,6 +351,7 @@
         'summary',
         'figure',
         'figcaption',
+        'img',
       ],
       ADD_ATTR: [
         'class',
@@ -429,13 +362,12 @@
         'aria-hidden',
         'aria-label',
         'title',
-        'data-md-image-src',
-        'data-md-image-alt',
-        'data-md-image-title',
-      ],
-      FORBID_TAGS: [
-        // raw HTML の <img> は使わない。Markdown画像は上の renderer.image で独自処理する。
-        'img',
+        'src',
+        'alt',
+        'loading',
+        'decoding',
+        'width',
+        'height',
       ],
     });
   }
@@ -465,271 +397,32 @@
     });
   }
 
-  function gmRequestBlob(url) {
-    return new Promise((resolve, reject) => {
-      const request =
-        typeof GM_xmlhttpRequest === 'function'
-          ? GM_xmlhttpRequest
-          : window.GM?.xmlHttpRequest;
-
-      if (!request) {
-        reject(new Error('GM_xmlhttpRequest is not available.'));
-        return;
-      }
-
-      request({
-        method: 'GET',
-        url,
-        responseType: 'blob',
-        timeout: 30000,
-
-        onload(response) {
-          if (response.status < 200 || response.status >= 300) {
-            reject(new Error(`Image request failed: HTTP ${response.status}`));
-            return;
-          }
-
-          const contentType =
-            /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1] ||
-            'application/octet-stream';
-
-          const blob =
-            response.response instanceof Blob
-              ? response.response
-              : new Blob([response.response], { type: contentType });
-
-          resolve(blob);
-        },
-
-        onerror() {
-          reject(new Error('Image request failed.'));
-        },
-
-        ontimeout() {
-          reject(new Error('Image request timed out.'));
-        },
-      });
-    });
-  }
-
-  function makeImagePlaceholder(message, url) {
-    const div = document.createElement('div');
-    div.className = 'md-renderer-image-placeholder';
-
-    const text = document.createElement('span');
-    text.textContent = message;
-    div.appendChild(text);
-
-    if (url) {
-      div.appendChild(document.createTextNode(' '));
-
-      const a = document.createElement('a');
-      a.href = url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      a.textContent = 'Open image';
-      div.appendChild(a);
-    }
-
-    return div;
-  }
-
-  function makeImageFigure(node, visualElement, absoluteUrl, alt) {
-    const figure = document.createElement('figure');
-    figure.className = 'md-renderer-image-figure';
-
-    const link = document.createElement('a');
-    link.href = absoluteUrl;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.style.display = 'inline-block';
-    link.style.maxWidth = '100%';
-
-    link.appendChild(visualElement);
-    figure.appendChild(link);
-
-    if (alt) {
-      const figcaption = document.createElement('figcaption');
-      figcaption.textContent = alt;
-      figure.appendChild(figcaption);
-    }
-
-    node.replaceWith(figure);
-
-    return figure;
-  }
-
-  async function decodeImageBlob(blob) {
-    if (window.createImageBitmap) {
-      return await createImageBitmap(blob);
-    }
-
-    return await new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
-      const image = new Image();
-
-      image.onload = () => {
-        URL.revokeObjectURL(objectUrl);
-        resolve(image);
-      };
-
-      image.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error('Image decode failed.'));
-      };
-
-      image.src = objectUrl;
-    });
-  }
-
-  function renderBlobImage(placeholder, blob, absoluteUrl, alt, title) {
-    return new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
-      mdRendererObjectUrls.push(objectUrl);
-
-      const image = document.createElement('img');
-      image.className = 'md-renderer-blob-image';
-      image.alt = alt || '';
-      image.title = title || alt || '';
-      image.loading = 'lazy';
-      image.decoding = 'async';
-      image.style.background = CONFIG.imageCanvasBackground || '#ffffff';
-
-      image.onload = () => {
-        makeImageFigure(placeholder, image, absoluteUrl, alt);
-
-        console.info('[md-renderer] image rendered via blob img:', {
-          url: absoluteUrl,
-          naturalWidth: image.naturalWidth,
-          naturalHeight: image.naturalHeight,
-          connected: image.isConnected,
-        });
-
-        resolve(true);
-      };
-
-      image.onerror = () => {
-        reject(new Error('Blob URL image rendering failed or was blocked by CSP.'));
-      };
-
-      image.src = objectUrl;
-    });
-  }
-
-  async function renderCanvasImage(placeholder, blob, absoluteUrl, alt, title) {
-    const bitmap = await decodeImageBlob(blob);
-
-    const canvas = document.createElement('canvas');
-    canvas.className = 'md-renderer-canvas-image';
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.title = title || alt || '';
-
-    canvas.style.display = 'block';
-    canvas.style.width = `${bitmap.width}px`;
-    canvas.style.maxWidth = '100%';
-    canvas.style.height = 'auto';
-    canvas.style.background = CONFIG.imageCanvasBackground || '#ffffff';
-
-    const figure = makeImageFigure(placeholder, canvas, absoluteUrl, alt);
-
-    // Firefox + sandboxed gist で、挿入前に描画した canvas が空白になるケースを避ける。
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-
-    const context = canvas.getContext('2d', {
-      alpha: false,
-      willReadFrequently: true,
-    });
-
-    context.save();
-    context.fillStyle = CONFIG.imageCanvasBackground || '#ffffff';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-
-    context.drawImage(bitmap, 0, 0);
-
-    let sample = null;
-
-    try {
-      sample = Array.from(
-        context.getImageData(
-          Math.floor(canvas.width / 2),
-          Math.floor(canvas.height / 2),
-          1,
-          1
-        ).data
-      );
-    } catch {
-      sample = 'unavailable';
-    }
-
-    console.info('[md-renderer] image rendered via canvas:', {
-      url: absoluteUrl,
-      width: bitmap.width,
-      height: bitmap.height,
-      connected: canvas.isConnected,
-      figureConnected: figure.isConnected,
-      samplePixelAtCenter: sample,
-    });
-  }
-
-  async function replaceImageRequestWithRenderableImage(requestNode, absoluteUrl, alt, title) {
-    if (requestNode.dataset.mdRendererProxyStarted === '1') return;
-    requestNode.dataset.mdRendererProxyStarted = '1';
-
-    const placeholder = makeImagePlaceholder(
-      'Loading image through userscript...',
-      absoluteUrl
-    );
-
-    requestNode.replaceWith(placeholder);
-
-    try {
-      const blob = await gmRequestBlob(absoluteUrl);
+  function postProcessImages(root) {
+    /**
+     * Safari 版: 相対パスの画像を絶対パスに変換する。
+     */
+    root.querySelectorAll('img[src]').forEach((img) => {
+      const src = img.getAttribute('src') || '';
 
       try {
-        // まず blob: URL の <img> として表示。
-        // 元画像URLを直接 src にしないため、通常の img-src CSP ブロックを避ける。
-        await renderBlobImage(placeholder, blob, absoluteUrl, alt, title);
-        return;
-      } catch (blobError) {
-        console.warn(
-          '[md-renderer] blob img failed; falling back to canvas:',
-          absoluteUrl,
-          blobError
-        );
+        img.src = new URL(src, location.href).href;
+      } catch {
+        // ignore invalid URL
       }
 
-      await renderCanvasImage(placeholder, blob, absoluteUrl, alt, title);
-    } catch (error) {
-      console.warn('[md-renderer] image rendering failed:', absoluteUrl, error);
-
-      const failed = makeImagePlaceholder('Image could not be rendered.', absoluteUrl);
-      placeholder.replaceWith(failed);
-    }
+      // レスポンシブ画像
+      if (!img.hasAttribute('loading')) {
+        img.loading = 'lazy';
+      }
+      if (!img.hasAttribute('decoding')) {
+        img.decoding = 'async';
+      }
+    });
   }
 
-  function postProcessImages(root) {
-    root
-      .querySelectorAll('.md-renderer-image-request[data-md-image-src]')
-      .forEach((node) => {
-        const src = node.getAttribute('data-md-image-src') || '';
-        const alt = node.getAttribute('data-md-image-alt') || '';
-        const title = node.getAttribute('data-md-image-title') || '';
-
-        let absoluteUrl;
-
-        try {
-          absoluteUrl = new URL(src, location.href).href;
-        } catch {
-          const failed = makeImagePlaceholder('Invalid image URL.', src);
-          node.replaceWith(failed);
-          return;
-        }
-
-        replaceImageRequestWithRenderableImage(node, absoluteUrl, alt, title);
-      });
-  }
+  // ---------------------------------------------------------------------------
+  // 数式レンダリング（デスクトップ版と同一）
+  // ---------------------------------------------------------------------------
 
   function shouldSkipMathNode(node) {
     const parent = node.parentElement;
@@ -940,6 +633,10 @@
     console.info(`[md-renderer] MathJax SVG rendered: ${count} expression(s)`);
   }
 
+  // ---------------------------------------------------------------------------
+  // ページレンダリング
+  // ---------------------------------------------------------------------------
+
   async function renderPage(markdown) {
     configureMarked();
 
@@ -989,7 +686,7 @@
       rawDetails.open = !rawDetails.open;
     });
 
-    console.info('[md-renderer] rendered successfully');
+    console.info('[md-renderer] rendered successfully (Safari edition)');
   }
 
   async function main() {
