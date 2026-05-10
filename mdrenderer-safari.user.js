@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.8.2
+// @version      0.8.3
 // @description  Render URLs ending in .md as HTML with MathJax SVG math. Safari/iPad optimized — images are rendered directly via <img> tags.
 // @author       you
 // @match        http://*/*.md*
@@ -451,12 +451,13 @@
 
   function postProcessImages(root) {
     /**
-     * Safari 版: <span> プレースホルダを直接 <img src="元URL"> に置換する。
-     * GM_xmlhttpRequest を使わず、ブラウザの通常の画像読み込みに任せる。
+     * Safari 版: <span> プレースホルダを置換する。
+     * CSP 制限を回避するため、fetch API で画像を取得して Blob URL に変換する。
+     * Gyazo など CORS 対応サーバからの画像であればこの方法で表示可能。
      */
     root
       .querySelectorAll('.md-renderer-image-request[data-md-image-src]')
-      .forEach((node) => {
+      .forEach(async (node) => {
         const src = node.getAttribute('data-md-image-src') || '';
         const alt = node.getAttribute('data-md-image-alt') || '';
         const title = node.getAttribute('data-md-image-title') || '';
@@ -469,7 +470,6 @@
           return;
         }
 
-        // figure > a > img の構造で直接挿入
         const figure = document.createElement('figure');
         figure.className = 'md-renderer-image-figure';
 
@@ -482,11 +482,13 @@
 
         const image = document.createElement('img');
         image.className = 'md-renderer-blob-image';
-        image.src = absoluteUrl;
         image.alt = alt;
         image.title = title || alt;
         image.loading = 'lazy';
         image.decoding = 'async';
+        
+        // フォールバック用の初期画像URL
+        image.src = absoluteUrl;
 
         link.appendChild(image);
         figure.appendChild(link);
@@ -498,6 +500,18 @@
         }
 
         node.replaceWith(figure);
+
+        // CSP 回避のための fetch & Blob URL 変換
+        try {
+          const response = await fetch(absoluteUrl, { mode: 'cors', credentials: 'omit' });
+          if (response.ok) {
+            const blob = await response.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            image.src = objectUrl;
+          }
+        } catch (error) {
+          console.warn('[md-renderer] fetch image failed:', absoluteUrl, error);
+        }
       });
   }
 
