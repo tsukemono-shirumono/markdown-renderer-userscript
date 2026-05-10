@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer
 // @namespace    https://example.local/userscripts
-// @version      0.7.1
+// @version      0.8.0
 // @description  Render URLs ending in .md as HTML with MathJax SVG math and CSP-resistant images.
 // @author       you
 // @match        http://*/*.md*
@@ -465,69 +465,10 @@
     });
   }
 
-  function gmRequestBlob(url) {
-    return new Promise((resolve, reject) => {
-      const request =
-        typeof GM_xmlhttpRequest === 'function'
-          ? GM_xmlhttpRequest
-          : window.GM?.xmlHttpRequest;
-
-      if (!request) {
-        reject(new Error('GM_xmlhttpRequest is not available.'));
-        return;
-      }
-
-      // iPad Safari の Userscripts 拡張では responseType:'blob' が
-      // 正しく Blob を返さないことがあるため、arraybuffer で取得し自前で Blob に変換する。
-      request({
-        method: 'GET',
-        url,
-        responseType: 'arraybuffer',
-        timeout: 30000,
-
-        onload(response) {
-          if (response.status < 200 || response.status >= 300) {
-            reject(new Error(`Image request failed: HTTP ${response.status}`));
-            return;
-          }
-
-          const contentType =
-            /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1]?.trim() ||
-            'application/octet-stream';
-
-          let blob;
-
-          if (response.response instanceof Blob) {
-            blob = response.response;
-          } else if (response.response instanceof ArrayBuffer) {
-            blob = new Blob([response.response], { type: contentType });
-          } else if (typeof response.response === 'string') {
-            // 一部の拡張は responseType を無視して文字列で返す
-            const binary = atob(response.response);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-              bytes[i] = binary.charCodeAt(i);
-            }
-            blob = new Blob([bytes], { type: contentType });
-          } else {
-            blob = new Blob([response.response], { type: contentType });
-          }
-
-          resolve(blob);
-        },
-
-        onerror() {
-          reject(new Error('Image request failed.'));
-        },
-
-        ontimeout() {
-          reject(new Error('Image request timed out.'));
-        },
-      });
-    });
-  }
-
   function makeImagePlaceholder(message, url) {
+    /**
+     * 画像読み込み中やエラー時に表示するプレースホルダを生成する。
+     */
     const div = document.createElement('div');
     div.className = 'md-renderer-image-placeholder';
 
@@ -550,6 +491,9 @@
   }
 
   function makeImageFigure(node, visualElement, absoluteUrl, alt) {
+    /**
+     * 画像要素を figure でラップし、元のノードと置換する。
+     */
     const figure = document.createElement('figure');
     figure.className = 'md-renderer-image-figure';
 
@@ -574,93 +518,192 @@
     return figure;
   }
 
-  function blobToDataUrl(blob) {
+  // ---------------------------------------------------------------------------
+  // 画像表示戦略（優先順）:
+  //   1. 直接 <img src="元URL"> — CSP が許可していれば最速・最も互換性が高い
+  //   2. fetch API → blob URL — CORS 対応サーバなら動作、CSP img-src を回避
+  //   3. GM_xmlhttpRequest → blob/data URL — CORS 非対応でも動作（デスクトップ向け）
+  //   4. エラー表示
+  //
+  // iPad Safari の Userscripts 拡張では GM_xmlhttpRequest の
+  // responseType: blob/arraybuffer 指定時にコールバックがサイレントフェイルする
+  // 既知の問題があるため、GM_xmlhttpRequest は最終手段とする。
+  // ---------------------------------------------------------------------------
+
+  function tryDirectImage(absoluteUrl, alt, title) {
     /**
-     * Blob を data: URL に変換する。
-     * blob: URL が CSP でブロックされる環境向けのフォールバック用。
+     * 直接 <img src="元URL"> で表示を試みる。
+     * CSP が img-src を制限していなければこれだけで十分。
      */
     return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error('FileReader failed.'));
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  async function decodeImageBlob(blob) {
-    /**
-     * Blob から描画可能な ImageBitmap または HTMLImageElement を返す。
-     * Safari では createImageBitmap(blob) が失敗する場合があるため、
-     * Object URL → Image のフォールバックを用意する。
-     */
-    if (window.createImageBitmap) {
-      try {
-        return await createImageBitmap(blob);
-      } catch (e) {
-        console.warn('[md-renderer] createImageBitmap failed, falling back to Image:', e);
-      }
-    }
-
-    return await new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
-      const image = new Image();
+      const image = document.createElement('img');
+      image.className = 'md-renderer-blob-image';
+      image.alt = alt || '';
+      image.title = title || alt || '';
+      image.decoding = 'async';
+      image.style.background = CONFIG.imageCanvasBackground || '#ffffff';
 
       image.onload = () => {
-        URL.revokeObjectURL(objectUrl);
+        console.info('[md-renderer] image rendered via direct img:', absoluteUrl);
         resolve(image);
       };
 
       image.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error('Image decode failed.'));
+        reject(new Error('Direct <img> loading failed (likely CSP block).'));
+      };
+
+      image.src = absoluteUrl;
+    });
+  }
+
+  async function tryFetchBlobImage(absoluteUrl, alt, title) {
+    /**
+     * fetch API で画像を取得し、blob URL の <img> として表示する。
+     * CORS 対応サーバの画像であれば CSP の img-src 制限を回避できる。
+     */
+    const response = await fetch(absoluteUrl, { mode: 'cors', credentials: 'omit' });
+
+    if (!response.ok) {
+      throw new Error(`fetch failed: HTTP ${response.status}`);
+    }
+
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    mdRendererObjectUrls.push(objectUrl);
+
+    return new Promise((resolve, reject) => {
+      const image = document.createElement('img');
+      image.className = 'md-renderer-blob-image';
+      image.alt = alt || '';
+      image.title = title || alt || '';
+      image.decoding = 'async';
+      image.style.background = CONFIG.imageCanvasBackground || '#ffffff';
+
+      image.onload = () => {
+        console.info('[md-renderer] image rendered via fetch+blob:', absoluteUrl);
+        resolve(image);
+      };
+
+      image.onerror = () => {
+        reject(new Error('fetch+blob image rendering failed.'));
       };
 
       image.src = objectUrl;
     });
   }
 
-  function renderBlobImage(placeholder, blob, absoluteUrl, alt, title) {
+  function gmRequestBlob(url) {
     /**
-     * blob: URL で <img> を表示する。
-     * CSP でブロックされた場合は data: URL にフォールバックする。
+     * GM_xmlhttpRequest で画像を取得し Blob として返す。
+     * コールバックがサイレントフェイルする拡張向けに独自タイムアウトを設定。
      */
     return new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
-      mdRendererObjectUrls.push(objectUrl);
+      const request =
+        typeof GM_xmlhttpRequest === 'function'
+          ? GM_xmlhttpRequest
+          : window.GM?.xmlHttpRequest;
 
+      if (!request) {
+        reject(new Error('GM_xmlhttpRequest is not available.'));
+        return;
+      }
+
+      let settled = false;
+
+      const settle = (fn) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+
+      // コールバックが一切発火しない場合の保護用タイムアウト（15秒）
+      const fallbackTimer = setTimeout(() => {
+        settle(() => reject(new Error('GM_xmlhttpRequest: no callback fired (silent failure).')));
+      }, 15000);
+
+      request({
+        method: 'GET',
+        url,
+        responseType: 'blob',
+        timeout: 30000,
+
+        onload(response) {
+          clearTimeout(fallbackTimer);
+
+          settle(() => {
+            if (response.status < 200 || response.status >= 300) {
+              reject(new Error(`Image request failed: HTTP ${response.status}`));
+              return;
+            }
+
+            const contentType =
+              /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1]?.trim() ||
+              'application/octet-stream';
+
+            let blob;
+
+            if (response.response instanceof Blob) {
+              blob = response.response;
+            } else if (response.response instanceof ArrayBuffer) {
+              blob = new Blob([response.response], { type: contentType });
+            } else {
+              blob = new Blob([response.response], { type: contentType });
+            }
+
+            resolve(blob);
+          });
+        },
+
+        onerror() {
+          clearTimeout(fallbackTimer);
+          settle(() => reject(new Error('Image request failed.')));
+        },
+
+        ontimeout() {
+          clearTimeout(fallbackTimer);
+          settle(() => reject(new Error('Image request timed out.')));
+        },
+      });
+    });
+  }
+
+  async function tryGmImage(absoluteUrl, alt, title) {
+    /**
+     * GM_xmlhttpRequest で画像を取得し、blob URL → data URL の順で <img> 表示を試みる。
+     */
+    const blob = await gmRequestBlob(absoluteUrl);
+    const objectUrl = URL.createObjectURL(blob);
+    mdRendererObjectUrls.push(objectUrl);
+
+    return new Promise((resolve, reject) => {
       const image = document.createElement('img');
       image.className = 'md-renderer-blob-image';
       image.alt = alt || '';
       image.title = title || alt || '';
-      image.loading = 'lazy';
       image.decoding = 'async';
       image.style.background = CONFIG.imageCanvasBackground || '#ffffff';
 
       image.onload = () => {
-        makeImageFigure(placeholder, image, absoluteUrl, alt);
-
-        console.info('[md-renderer] image rendered via blob img:', {
-          url: absoluteUrl,
-          naturalWidth: image.naturalWidth,
-          naturalHeight: image.naturalHeight,
-          connected: image.isConnected,
-        });
-
-        resolve(true);
+        console.info('[md-renderer] image rendered via GM_xmlhttpRequest+blob:', absoluteUrl);
+        resolve(image);
       };
 
       image.onerror = async () => {
-        // blob: URL が CSP でブロックされた場合、data: URL で再試行
+        // blob: URL が CSP でブロックされた場合、data: URL にフォールバック
         console.warn('[md-renderer] blob: URL blocked, trying data: URL:', absoluteUrl);
-
         try {
-          const dataUrl = await blobToDataUrl(blob);
+          const reader = new FileReader();
+          const dataUrl = await new Promise((res, rej) => {
+            reader.onload = () => res(reader.result);
+            reader.onerror = () => rej(new Error('FileReader failed.'));
+            reader.readAsDataURL(blob);
+          });
           image.onerror = () => {
-            reject(new Error('Both blob: and data: URL image rendering failed.'));
+            reject(new Error('GM blob+data URL image rendering failed.'));
           };
           image.src = dataUrl;
         } catch {
-          reject(new Error('Blob URL image rendering failed and data: URL conversion failed.'));
+          reject(new Error('GM blob image rendering and data URL conversion failed.'));
         }
       };
 
@@ -668,101 +711,52 @@
     });
   }
 
-  async function renderCanvasImage(placeholder, blob, absoluteUrl, alt, title) {
-    const bitmap = await decodeImageBlob(blob);
-
-    const canvas = document.createElement('canvas');
-    canvas.className = 'md-renderer-canvas-image';
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.title = title || alt || '';
-
-    canvas.style.display = 'block';
-    canvas.style.width = `${bitmap.width}px`;
-    canvas.style.maxWidth = '100%';
-    canvas.style.height = 'auto';
-    canvas.style.background = CONFIG.imageCanvasBackground || '#ffffff';
-
-    const figure = makeImageFigure(placeholder, canvas, absoluteUrl, alt);
-
-    // Firefox + sandboxed gist で、挿入前に描画した canvas が空白になるケースを避ける。
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-
-    const context = canvas.getContext('2d', {
-      alpha: false,
-      willReadFrequently: true,
-    });
-
-    context.save();
-    context.fillStyle = CONFIG.imageCanvasBackground || '#ffffff';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-
-    context.drawImage(bitmap, 0, 0);
-
-    let sample = null;
-
-    try {
-      sample = Array.from(
-        context.getImageData(
-          Math.floor(canvas.width / 2),
-          Math.floor(canvas.height / 2),
-          1,
-          1
-        ).data
-      );
-    } catch {
-      sample = 'unavailable';
-    }
-
-    console.info('[md-renderer] image rendered via canvas:', {
-      url: absoluteUrl,
-      width: bitmap.width,
-      height: bitmap.height,
-      connected: canvas.isConnected,
-      figureConnected: figure.isConnected,
-      samplePixelAtCenter: sample,
-    });
-  }
-
   async function replaceImageRequestWithRenderableImage(requestNode, absoluteUrl, alt, title) {
     /**
      * 画像プレースホルダを実際の画像に置換する。
-     * 3段階フォールバック: blob: URL → data: URL（renderBlobImage内）→ canvas 描画
+     * 4段階フォールバック: 直接img → fetch+blob → GM_xmlhttpRequest+blob/data → エラー
      */
     if (requestNode.dataset.mdRendererProxyStarted === '1') return;
     requestNode.dataset.mdRendererProxyStarted = '1';
 
     const placeholder = makeImagePlaceholder(
-      'Loading image through userscript...',
+      'Loading image...',
       absoluteUrl
     );
 
     requestNode.replaceWith(placeholder);
 
+    // 戦略1: 直接 <img src="元URL"> で表示（CSP 非制限環境向け）
     try {
-      const blob = await gmRequestBlob(absoluteUrl);
-
-      try {
-        // まず blob: URL の <img> として表示（内部で data: URL フォールバックあり）。
-        await renderBlobImage(placeholder, blob, absoluteUrl, alt, title);
-        return;
-      } catch (blobError) {
-        console.warn(
-          '[md-renderer] blob/data img failed; falling back to canvas:',
-          absoluteUrl,
-          blobError
-        );
-      }
-
-      // blob/data URL 共に失敗した場合、canvas に描画
-      await renderCanvasImage(placeholder, blob, absoluteUrl, alt, title);
-    } catch (error) {
-      console.warn('[md-renderer] image rendering failed:', absoluteUrl, error);
-
-      const failed = makeImagePlaceholder('Image could not be rendered.', absoluteUrl);
-      placeholder.replaceWith(failed);
+      const image = await tryDirectImage(absoluteUrl, alt, title);
+      makeImageFigure(placeholder, image, absoluteUrl, alt);
+      return;
+    } catch (e) {
+      console.warn('[md-renderer] direct img failed:', absoluteUrl, e.message);
     }
+
+    // 戦略2: fetch API → blob URL（CORS 対応サーバ向け）
+    try {
+      const image = await tryFetchBlobImage(absoluteUrl, alt, title);
+      makeImageFigure(placeholder, image, absoluteUrl, alt);
+      return;
+    } catch (e) {
+      console.warn('[md-renderer] fetch+blob failed:', absoluteUrl, e.message);
+    }
+
+    // 戦略3: GM_xmlhttpRequest → blob/data URL（デスクトップ向けフォールバック）
+    try {
+      const image = await tryGmImage(absoluteUrl, alt, title);
+      makeImageFigure(placeholder, image, absoluteUrl, alt);
+      return;
+    } catch (e) {
+      console.warn('[md-renderer] GM_xmlhttpRequest failed:', absoluteUrl, e.message);
+    }
+
+    // すべて失敗
+    console.error('[md-renderer] all image strategies failed:', absoluteUrl);
+    const failed = makeImagePlaceholder('Image could not be rendered.', absoluteUrl);
+    placeholder.replaceWith(failed);
   }
 
   function postProcessImages(root) {
