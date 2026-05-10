@@ -477,10 +477,12 @@
         return;
       }
 
+      // iPad Safari の Userscripts 拡張では responseType:'blob' が
+      // 正しく Blob を返さないことがあるため、arraybuffer で取得し自前で Blob に変換する。
       request({
         method: 'GET',
         url,
-        responseType: 'blob',
+        responseType: 'arraybuffer',
         timeout: 30000,
 
         onload(response) {
@@ -490,13 +492,26 @@
           }
 
           const contentType =
-            /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1] ||
+            /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1]?.trim() ||
             'application/octet-stream';
 
-          const blob =
-            response.response instanceof Blob
-              ? response.response
-              : new Blob([response.response], { type: contentType });
+          let blob;
+
+          if (response.response instanceof Blob) {
+            blob = response.response;
+          } else if (response.response instanceof ArrayBuffer) {
+            blob = new Blob([response.response], { type: contentType });
+          } else if (typeof response.response === 'string') {
+            // 一部の拡張は responseType を無視して文字列で返す
+            const binary = atob(response.response);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            blob = new Blob([bytes], { type: contentType });
+          } else {
+            blob = new Blob([response.response], { type: contentType });
+          }
 
           resolve(blob);
         },
@@ -559,9 +574,31 @@
     return figure;
   }
 
+  function blobToDataUrl(blob) {
+    /**
+     * Blob を data: URL に変換する。
+     * blob: URL が CSP でブロックされる環境向けのフォールバック用。
+     */
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('FileReader failed.'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
   async function decodeImageBlob(blob) {
+    /**
+     * Blob から描画可能な ImageBitmap または HTMLImageElement を返す。
+     * Safari では createImageBitmap(blob) が失敗する場合があるため、
+     * Object URL → Image のフォールバックを用意する。
+     */
     if (window.createImageBitmap) {
-      return await createImageBitmap(blob);
+      try {
+        return await createImageBitmap(blob);
+      } catch (e) {
+        console.warn('[md-renderer] createImageBitmap failed, falling back to Image:', e);
+      }
     }
 
     return await new Promise((resolve, reject) => {
@@ -583,6 +620,10 @@
   }
 
   function renderBlobImage(placeholder, blob, absoluteUrl, alt, title) {
+    /**
+     * blob: URL で <img> を表示する。
+     * CSP でブロックされた場合は data: URL にフォールバックする。
+     */
     return new Promise((resolve, reject) => {
       const objectUrl = URL.createObjectURL(blob);
       mdRendererObjectUrls.push(objectUrl);
@@ -608,8 +649,19 @@
         resolve(true);
       };
 
-      image.onerror = () => {
-        reject(new Error('Blob URL image rendering failed or was blocked by CSP.'));
+      image.onerror = async () => {
+        // blob: URL が CSP でブロックされた場合、data: URL で再試行
+        console.warn('[md-renderer] blob: URL blocked, trying data: URL:', absoluteUrl);
+
+        try {
+          const dataUrl = await blobToDataUrl(blob);
+          image.onerror = () => {
+            reject(new Error('Both blob: and data: URL image rendering failed.'));
+          };
+          image.src = dataUrl;
+        } catch {
+          reject(new Error('Blob URL image rendering failed and data: URL conversion failed.'));
+        }
       };
 
       image.src = objectUrl;
@@ -674,6 +726,10 @@
   }
 
   async function replaceImageRequestWithRenderableImage(requestNode, absoluteUrl, alt, title) {
+    /**
+     * 画像プレースホルダを実際の画像に置換する。
+     * 3段階フォールバック: blob: URL → data: URL（renderBlobImage内）→ canvas 描画
+     */
     if (requestNode.dataset.mdRendererProxyStarted === '1') return;
     requestNode.dataset.mdRendererProxyStarted = '1';
 
@@ -688,18 +744,18 @@
       const blob = await gmRequestBlob(absoluteUrl);
 
       try {
-        // まず blob: URL の <img> として表示。
-        // 元画像URLを直接 src にしないため、通常の img-src CSP ブロックを避ける。
+        // まず blob: URL の <img> として表示（内部で data: URL フォールバックあり）。
         await renderBlobImage(placeholder, blob, absoluteUrl, alt, title);
         return;
       } catch (blobError) {
         console.warn(
-          '[md-renderer] blob img failed; falling back to canvas:',
+          '[md-renderer] blob/data img failed; falling back to canvas:',
           absoluteUrl,
           blobError
         );
       }
 
+      // blob/data URL 共に失敗した場合、canvas に描画
       await renderCanvasImage(placeholder, blob, absoluteUrl, alt, title);
     } catch (error) {
       console.warn('[md-renderer] image rendering failed:', absoluteUrl, error);
