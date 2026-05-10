@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.8.1
+// @version      0.8.2
 // @description  Render URLs ending in .md as HTML with MathJax SVG math. Safari/iPad optimized — images are rendered directly via <img> tags.
 // @author       you
 // @match        http://*/*.md*
@@ -255,8 +255,8 @@
         background: color-mix(in srgb, CanvasText 18%, transparent);
       }
 
-      /* Safari 版: 画像は直接 <img> で表示 */
-      .md-renderer-content img {
+      /* Safari 版: 画像は <img> で直接表示 */
+      .md-renderer-blob-image {
         display: block;
         max-width: 100%;
         height: auto;
@@ -264,7 +264,25 @@
         background: #fff;
         box-sizing: border-box;
         border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+      }
+
+      .md-renderer-image-figure {
+        display: block;
         margin: 1.2em 0;
+        max-width: 100%;
+        overflow-x: auto;
+      }
+
+      .md-renderer-image-figure a {
+        display: inline-block;
+        max-width: 100%;
+      }
+
+      .md-renderer-image-figure figcaption {
+        margin-top: 0.5em;
+        color: color-mix(in srgb, CanvasText 68%, transparent);
+        font-size: 0.92em;
+        line-height: 1.45;
       }
 
       .md-renderer-raw {
@@ -327,20 +345,55 @@
 
   function configureMarked() {
     /**
-     * marked の設定。Safari 版では renderer.image をカスタマイズせず、
-     * デフォルトの <img> タグをそのまま出力させる。
+     * marked の設定。デスクトップ版と同じく renderer.image をカスタマイズし、
+     * <span> プレースホルダに変換する。DOMPurify を通過した後にプログラムで
+     * <img> を直接 DOM に挿入するため、DOMPurify の img 除去問題を回避できる。
      */
+    const renderer = new window.marked.Renderer();
+
+    renderer.image = function imageRenderer(hrefOrToken, titleArg, textArg) {
+      let href = '';
+      let title = '';
+      let text = '';
+
+      // marked v15 形式: renderer.image(token)
+      if (
+        hrefOrToken &&
+        typeof hrefOrToken === 'object' &&
+        Object.prototype.hasOwnProperty.call(hrefOrToken, 'href')
+      ) {
+        href = hrefOrToken.href || '';
+        title = hrefOrToken.title || '';
+        text = hrefOrToken.text || '';
+      } else {
+        // 旧形式互換: renderer.image(href, title, text)
+        href = hrefOrToken || '';
+        title = titleArg || '';
+        text = textArg || '';
+      }
+
+      return `
+        <span
+          class="md-renderer-image-request"
+          data-md-image-src="${escapeHtml(href)}"
+          data-md-image-alt="${escapeHtml(text)}"
+          data-md-image-title="${escapeHtml(title)}"
+        ></span>
+      `;
+    };
+
     window.marked.setOptions({
       gfm: true,
       breaks: CONFIG.breaks,
       async: false,
+      renderer,
     });
   }
 
   function sanitizeHtml(html) {
     /**
-     * Safari 版: <img> を許可し、src / alt / loading 属性を通す。
-     * CSP プロキシ処理は行わないため、画像は直接表示される。
+     * Safari 版: デスクトップ版と同じ設定。
+     * 画像は <span> プレースホルダ経由で処理するため <img> は FORBID_TAGS に入れる。
      */
     return window.DOMPurify.sanitize(html, {
       USE_PROFILES: {
@@ -351,7 +404,6 @@
         'summary',
         'figure',
         'figcaption',
-        'img',
       ],
       ADD_ATTR: [
         'class',
@@ -362,12 +414,12 @@
         'aria-hidden',
         'aria-label',
         'title',
-        'src',
-        'alt',
-        'loading',
-        'decoding',
-        'width',
-        'height',
+        'data-md-image-src',
+        'data-md-image-alt',
+        'data-md-image-title',
+      ],
+      FORBID_TAGS: [
+        'img',
       ],
     });
   }
@@ -399,25 +451,54 @@
 
   function postProcessImages(root) {
     /**
-     * Safari 版: 相対パスの画像を絶対パスに変換する。
+     * Safari 版: <span> プレースホルダを直接 <img src="元URL"> に置換する。
+     * GM_xmlhttpRequest を使わず、ブラウザの通常の画像読み込みに任せる。
      */
-    root.querySelectorAll('img[src]').forEach((img) => {
-      const src = img.getAttribute('src') || '';
+    root
+      .querySelectorAll('.md-renderer-image-request[data-md-image-src]')
+      .forEach((node) => {
+        const src = node.getAttribute('data-md-image-src') || '';
+        const alt = node.getAttribute('data-md-image-alt') || '';
+        const title = node.getAttribute('data-md-image-title') || '';
 
-      try {
-        img.src = new URL(src, location.href).href;
-      } catch {
-        // ignore invalid URL
-      }
+        let absoluteUrl;
 
-      // レスポンシブ画像
-      if (!img.hasAttribute('loading')) {
-        img.loading = 'lazy';
-      }
-      if (!img.hasAttribute('decoding')) {
-        img.decoding = 'async';
-      }
-    });
+        try {
+          absoluteUrl = new URL(src, location.href).href;
+        } catch {
+          return;
+        }
+
+        // figure > a > img の構造で直接挿入
+        const figure = document.createElement('figure');
+        figure.className = 'md-renderer-image-figure';
+
+        const link = document.createElement('a');
+        link.href = absoluteUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.style.display = 'inline-block';
+        link.style.maxWidth = '100%';
+
+        const image = document.createElement('img');
+        image.className = 'md-renderer-blob-image';
+        image.src = absoluteUrl;
+        image.alt = alt;
+        image.title = title || alt;
+        image.loading = 'lazy';
+        image.decoding = 'async';
+
+        link.appendChild(image);
+        figure.appendChild(link);
+
+        if (alt) {
+          const figcaption = document.createElement('figcaption');
+          figcaption.textContent = alt;
+          figure.appendChild(figcaption);
+        }
+
+        node.replaceWith(figure);
+      });
   }
 
   // ---------------------------------------------------------------------------
