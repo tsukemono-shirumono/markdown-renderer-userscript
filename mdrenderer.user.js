@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer
 // @namespace    https://example.local/userscripts
-// @version      0.7.0
+// @version      0.7.1
 // @description  Render URLs ending in .md as HTML with MathJax SVG math and CSP-resistant images.
 // @author       you
 // @match        http://*/*.md*
