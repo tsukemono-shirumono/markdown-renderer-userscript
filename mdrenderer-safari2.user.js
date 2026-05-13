@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.9.0
+// @version      0.9.1
 // @description  Render raw .md URLs as standalone HTML on Safari/iPad. Embeds external images as Base64 data URLs before opening a blob HTML document.
 // @author       you
 // @match        http://*/*.md*
@@ -41,6 +41,10 @@
     imageConcurrency: 3,
 
     imageTimeoutMs: 30000,
+
+    // Userscripts 側の通信が返ってこない場合に備えた追加タイムアウト。
+    hardTimeoutE([github.com](https://github.com/quoid/userscripts?utm_source=chatgpt.com))  // 画像取得ログを Safari Web Inspector の Console に出す。
+    debugImageRequests: true,
 
     // SVG は data URL 化して <img> 表示するだけなら通常スクリプト実行されないが、
     // 安全側に倒して既定では埋め込まない。必要なら true にする。
@@ -546,52 +550,157 @@
 
   function getGmXmlHttpRequest() {
     if (window.GM && typeof window.GM.xmlHttpRequest === 'function') {
-      return window.GM.xmlHttpRequest.bind(window.GM);
+      return {
+        mode: 'promise',
+        request: window.GM.xmlHttpRequest.bind(window.GM),
+      };
     }
 
     if (typeof GM_xmlhttpRequest === 'function') {
-      return GM_xmlhttpRequest;
+      return {
+        mode: 'callback',
+        request: GM_xmlhttpRequest,
+      };
     }
 
     return null;
   }
 
-  function gmXmlHttpRequest(details) {
-    const request = getGmXmlHttpRequest();
+  function toError(value, fallbackMessage = 'GM request failed') {
+    if (value instanceof Error) return value;
 
-    if (!request) {
+    if (value && typeof value === 'object') {
+      const status = value.status ? `HTTP ${value.status}` : '';
+      const statusText = value.statusText || '';
+      const message = [status, statusText].filter(Boolean).join(' ');
+      return new Error(message || fallbackMessage);
+    }
+
+    return new Error(String(value || fallbackMessage));
+  }
+
+  function withHardTimeout(promise, { timeoutMs, abort, label }) {
+    let timer = null;
+    let settled = false;
+
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+
+        try {
+          if (typeof abort === 'function') abort();
+        } catch {
+          // ignore abort errors
+        }
+
+        reject(new Error(`GM request hard-timeout after ${timeoutMs}ms: ${label}`));
+      }, timeoutMs);
+    });
+
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+      settled = true;
+      if (timer) clearTimeout(timer);
+    });
+  }
+
+  async function gmXmlHttpRequest(details) {
+    const gm = getGmXmlHttpRequest();
+
+    if (!gm) {
       throw new Error('GM.xmlHttpRequest is not available. Use @inject-into content and grant GM.xmlHttpRequest.');
     }
 
-    return new Promise((resolve, reject) => {
+    const timeoutMs = Number(details.timeout || CONFIG.imageTimeoutMs || 30000);
+    const hardTimeoutMs = timeoutMs + Number(CONFIG.hardTimeoutExtraMs || 0);
+    const label = details.url || 'unknown URL';
+
+    if (gm.mode === 'promise') {
+      let handle = null;
+
+      const requestDetails = { ...details };
+      delete requestDetails.onload;
+      delete requestDetails.onerror;
+      delete requestDetails.onabort;
+      delete requestDetails.ontimeout;
+      delete requestDetails.onreadystatechange;
+      delete requestDetails.onloadend;
+      delete requestDetails.onloadstart;
+
+      const promise = new Promise((resolve, reject) => {
+        try {
+          if (CONFIG.debugImageRequests) {
+            console.info('[md-renderer] GM.xmlHttpRequest start:', label);
+          }
+
+          handle = gm.request(requestDetails);
+          Promise.resolve(handle).then(resolve, reject);
+        } catch (error) {
+          reject(error);
+        }
+      }).then((response) => {
+        if (CONFIG.debugImageRequests) {
+          console.info('[md-renderer] GM.xmlHttpRequest done:', label, response?.status, response?.responseType);
+        }
+
+        return response;
+      });
+
+      return await withHardTimeout(promise, {
+        timeoutMs: hardTimeoutMs,
+        label,
+        abort: () => handle?.abort?.(),
+      });
+    }
+
+    return await new Promise((resolve, reject) => {
+      let handle = null;
       let settled = false;
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+
+        try {
+          handle?.abort?.();
+        } catch {
+          // ignore abort errors
+        }
+
+        reject(new Error(`GM request hard-timeout after ${hardTimeoutMs}ms: ${label}`));
+      }, hardTimeoutMs);
 
       const settleResolve = (value) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
+
+        if (CONFIG.debugImageRequests) {
+          console.info('[md-renderer] GM_xmlhttpRequest done:', label, value?.status, value?.responseType);
+        }
+
         resolve(value);
       };
 
       const settleReject = (error) => {
         if (settled) return;
         settled = true;
-        reject(error instanceof Error ? error : new Error(String(error || 'GM request failed')));
-      };
-
-      const requestDetails = {
-        ...details,
-        onload: settleResolve,
-        onerror: settleReject,
-        onabort: () => settleReject(new Error('GM request aborted')),
-        ontimeout: () => settleReject(new Error('GM request timed out')),
+        clearTimeout(timer);
+        reject(toError(error));
       };
 
       try {
-        const result = request(requestDetails);
-
-        if (result && typeof result.then === 'function') {
-          result.then(settleResolve, settleReject);
+        if (CONFIG.debugImageRequests) {
+          console.info('[md-renderer] GM_xmlhttpRequest start:', label);
         }
+
+        handle = gm.request({
+          ...details,
+          onload: settleResolve,
+          onerror: settleReject,
+          onabort: () => settleReject(new Error('GM request aborted')),
+          ontimeout: () => settleReject(new Error('GM request timed out')),
+        });
       } catch (error) {
         settleReject(error);
       }
@@ -665,39 +774,53 @@
     const response = await gmXmlHttpRequest({
       method: 'GET',
       url,
-      responseType: 'blob',
+      responseType: 'arraybuffer',
       timeout: CONFIG.imageTimeoutMs,
-      anonymous: true,
       headers: {
         Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
       },
     });
 
-    const status = Number(response.status || 0);
+    const status = Number(response?.status || 0);
 
     if (status < 200 || status >= 300) {
       throw new Error(`HTTP ${status || 'unknown'}`);
     }
 
-    let blob = response.response;
+    const headerMimeType = normalizeMimeType(getHeader(response.responseHeaders, 'content-type'));
+    const guessedMimeType = guessImageMimeType(url);
+    let mimeType = headerMimeType || guessedMimeType || 'application/octet-stream';
+    let body = response.response;
+
+    if (body instanceof Blob) {
+      if (!mimeType && body.type) {
+        mimeType = normalizeMimeType(body.type);
+      }
+    } else if (body instanceof ArrayBuffer) {
+      body = new Blob([body], { type: mimeType });
+    } else if (ArrayBuffer.isView(body)) {
+      body = new Blob([body.buffer], { type: mimeType });
+    } else if (typeof body === 'string') {
+      body = new Blob([body], { type: mimeType });
+    } else if (typeof response.responseText === 'string') {
+      body = new Blob([response.responseText], { type: mimeType });
+    } else {
+      throw new Error(`Unsupported GM response body: ${Object.prototype.toString.call(body)}`);
+    }
+
+    let blob = body;
 
     if (!(blob instanceof Blob)) {
-      if (typeof response.responseText === 'string') {
-        const contentType = normalizeMimeType(getHeader(response.responseHeaders, 'content-type')) || 'application/octet-stream';
-        blob = new Blob([response.responseText], { type: contentType });
-      } else {
-        throw new Error('Response is not a Blob');
-      }
+      throw new Error('Response is not convertible to Blob');
+    }
+
+    if (!mimeType || mimeType === 'application/octet-stream') {
+      mimeType = normalizeMimeType(blob.type) || guessedMimeType || mimeType;
     }
 
     if (blob.size > CONFIG.maxImageBytes) {
       throw new Error(`Image is too large: ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
     }
-
-    const headerMimeType = normalizeMimeType(getHeader(response.responseHeaders, 'content-type'));
-    const blobMimeType = normalizeMimeType(blob.type);
-    const guessedMimeType = guessImageMimeType(url);
-    const mimeType = blobMimeType || headerMimeType || guessedMimeType;
 
     if (!mimeType.startsWith('image/')) {
       throw new Error(`Response is not an image: ${mimeType || 'unknown content-type'}`);
