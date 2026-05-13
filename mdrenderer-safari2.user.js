@@ -1,16 +1,17 @@
 // ==UserScript==
-// @name         Markdown Renderer
+// @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.7.0 (Base64 Bypass Mod)
-// @description  Render URLs ending in .md as HTML with MathJax SVG math and CSP-resistant images via Base64.
-// @author       you & Gemini
+// @version      0.9.0
+// @description  Render raw .md URLs as standalone HTML on Safari/iPad. Embeds external images as Base64 data URLs before opening a blob HTML document.
+// @author       you
 // @match        http://*/*.md*
 // @match        https://*/*.md*
 // @include      /^https?:\/\/.*\.md(?:[?#].*)?$/
 // @run-at       document-idle
+// @inject-into  content
 // @grant        GM_addStyle
+// @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
-// @connect      *
 // @require      https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.2.5/dist/purify.min.js
 // @require      https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg-full.js
@@ -30,20 +31,404 @@
     // $...$ をインライン数式として扱う。
     enableSingleDollarInlineMath: true,
 
-    // arXiv などの透明PNG対策。
-    imageCanvasBackground: '#ffffff',
+    // 画像を GM.xmlHttpRequest で取得して data:image/...;base64,... に埋め込む。
+    embedImagesAsDataUrls: true,
+
+    // iPad Safari のメモリ対策。大きすぎる画像は外部 URL フォールバックにする。
+    maxImageBytes: 12 * 1024 * 1024,
+
+    // 同時ダウンロード数。多すぎると iPad Safari で不安定になりやすい。
+    imageConcurrency: 3,
+
+    imageTimeoutMs: 30000,
+
+    // SVG は data URL 化して <img> 表示するだけなら通常スクリプト実行されないが、
+    // 安全側に倒して既定では埋め込まない。必要なら true にする。
+    allowSvgImageEmbedding: false,
   };
+
+  const STATE = {
+    sourceUrl: location.href,
+    sourceTitle: decodeURIComponent(location.pathname.split('/').pop() || 'Markdown'),
+    mathJaxCss: '',
+  };
+
+  const APP_CSS = `
+    :root {
+      color-scheme: light dark;
+    }
+
+    html.md-renderer-active,
+    html.md-renderer-active body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+
+    body.md-renderer-body {
+      font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        "Noto Sans JP",
+        "Noto Sans",
+        Helvetica,
+        Arial,
+        sans-serif;
+      line-height: 1.65;
+    }
+
+    .md-renderer-shell {
+      box-sizing: border-box;
+      max-width: ${CONFIG.maxWidth};
+      margin: 0 auto;
+      padding: 32px 20px 72px;
+    }
+
+    .md-renderer-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 32px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+    }
+
+    .md-renderer-eyebrow {
+      margin-bottom: 4px;
+      color: color-mix(in srgb, CanvasText 58%, transparent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .md-renderer-title {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+
+    .md-renderer-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .md-renderer-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 0 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+      border-radius: 8px;
+      color: CanvasText;
+      text-decoration: none;
+      font-size: 13px;
+      background: color-mix(in srgb, Canvas 92%, CanvasText);
+      cursor: pointer;
+    }
+
+    .md-renderer-button:hover {
+      background: color-mix(in srgb, Canvas 84%, CanvasText);
+    }
+
+    .md-renderer-content {
+      font-size: 16px;
+    }
+
+    .md-renderer-content > :first-child {
+      margin-top: 0;
+    }
+
+    .md-renderer-content > :last-child {
+      margin-bottom: 0;
+    }
+
+    .md-renderer-content h1,
+    .md-renderer-content h2,
+    .md-renderer-content h3,
+    .md-renderer-content h4,
+    .md-renderer-content h5,
+    .md-renderer-content h6 {
+      margin-top: 1.8em;
+      margin-bottom: 0.7em;
+      line-height: 1.25;
+    }
+
+    .md-renderer-content h1 {
+      padding-bottom: 0.3em;
+      border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+      font-size: 2em;
+    }
+
+    .md-renderer-content h2 {
+      padding-bottom: 0.25em;
+      border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+      font-size: 1.5em;
+    }
+
+    .md-renderer-content h3 {
+      font-size: 1.25em;
+    }
+
+    .md-renderer-content p,
+    .md-renderer-content ul,
+    .md-renderer-content ol,
+    .md-renderer-content blockquote,
+    .md-renderer-content table,
+    .md-renderer-content pre,
+    .md-renderer-content figure {
+      margin-top: 0;
+      margin-bottom: 1em;
+    }
+
+    .md-renderer-content a {
+      color: LinkText;
+    }
+
+    .md-renderer-content blockquote {
+      padding: 0 1em;
+      color: color-mix(in srgb, CanvasText 68%, transparent);
+      border-left: 4px solid color-mix(in srgb, CanvasText 22%, transparent);
+    }
+
+    .md-renderer-content code {
+      padding: 0.15em 0.35em;
+      border-radius: 5px;
+      background: color-mix(in srgb, CanvasText 9%, transparent);
+      font-family:
+        ui-monospace,
+        SFMono-Regular,
+        SFMono,
+        Consolas,
+        "Liberation Mono",
+        Menlo,
+        monospace;
+      font-size: 0.88em;
+    }
+
+    .md-renderer-content pre {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 10px;
+      background: color-mix(in srgb, CanvasText 8%, transparent);
+    }
+
+    .md-renderer-content pre code {
+      display: block;
+      padding: 0;
+      background: transparent;
+      font-size: 0.9em;
+      white-space: pre;
+    }
+
+    .md-renderer-content table {
+      display: block;
+      width: 100%;
+      overflow: auto;
+      border-collapse: collapse;
+    }
+
+    .md-renderer-content th,
+    .md-renderer-content td {
+      padding: 6px 12px;
+      border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+    }
+
+    .md-renderer-content th {
+      background: color-mix(in srgb, CanvasText 7%, transparent);
+      font-weight: 600;
+    }
+
+    .md-renderer-content hr {
+      height: 1px;
+      margin: 24px 0;
+      border: 0;
+      background: color-mix(in srgb, CanvasText 18%, transparent);
+    }
+
+    .md-renderer-blob-image {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      background: #fff;
+      box-sizing: border-box;
+      border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+    }
+
+    .md-renderer-image-figure {
+      display: block;
+      margin: 1.2em 0;
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .md-renderer-image-figure a {
+      display: inline-block;
+      max-width: 100%;
+    }
+
+    .md-renderer-image-figure figcaption {
+      margin-top: 0.5em;
+      color: color-mix(in srgb, CanvasText 68%, transparent);
+      font-size: 0.92em;
+      line-height: 1.45;
+    }
+
+    .md-renderer-image-note {
+      margin-top: 0.45em;
+      color: color-mix(in srgb, CanvasText 58%, transparent);
+      font-size: 0.84em;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+
+    .md-renderer-raw {
+      margin-top: 48px;
+      padding-top: 20px;
+      border-top: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+    }
+
+    .md-renderer-raw summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .md-renderer-raw pre {
+      overflow: auto;
+      margin-top: 12px;
+      padding: 16px;
+      border-radius: 10px;
+      background: color-mix(in srgb, CanvasText 8%, transparent);
+    }
+
+    .md-renderer-math-inline mjx-container {
+      display: inline-block;
+      vertical-align: -0.12em;
+    }
+
+    .md-renderer-math-display {
+      display: block;
+      overflow-x: auto;
+      margin: 1em 0;
+      text-align: center;
+    }
+
+    .md-renderer-math-display mjx-container {
+      display: inline-block;
+      max-width: 100%;
+    }
+
+    .md-renderer-math-error {
+      color: #b00020;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+
+    .md-renderer-status-card {
+      box-sizing: border-box;
+      max-width: 680px;
+      margin: 12vh auto;
+      padding: 24px 20px;
+      border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+      border-radius: 14px;
+      background: color-mix(in srgb, Canvas 96%, CanvasText);
+      color: CanvasText;
+      box-shadow: 0 12px 36px color-mix(in srgb, CanvasText 12%, transparent);
+    }
+
+    .md-renderer-status-title {
+      margin: 0 0 8px;
+      font-size: 20px;
+      line-height: 1.35;
+    }
+
+    .md-renderer-status-detail {
+      margin: 0;
+      color: color-mix(in srgb, CanvasText 68%, transparent);
+      font-size: 14px;
+      line-height: 1.6;
+      word-break: break-word;
+    }
+
+    @media (max-width: 640px) {
+      .md-renderer-shell {
+        padding: 20px 14px 56px;
+      }
+
+      .md-renderer-header {
+        flex-direction: column;
+      }
+
+      .md-renderer-actions {
+        justify-content: flex-start;
+      }
+
+      .md-renderer-title {
+        font-size: 20px;
+      }
+    }
+  `;
 
   if (!CONFIG.markdownUrlPattern.test(location.href)) return;
 
-  // ※Base64化に伴い、Object URLのクリーンアップ処理（mdRendererObjectUrls）は不要になったから消したよ！✌️
-
   function hasRequiredLibraries() {
-    return (
-      window.marked &&
-      window.DOMPurify &&
-      window.MathJax
-    );
+    return Boolean(window.marked && window.DOMPurify && window.MathJax);
+  }
+
+  function addStyle(css) {
+    if (!css) return;
+
+    try {
+      if (typeof GM_addStyle === 'function') {
+        GM_addStyle(css);
+        return;
+      }
+    } catch {
+      // fall through
+    }
+
+    try {
+      if (window.GM && typeof window.GM.addStyle === 'function') {
+        window.GM.addStyle(css);
+        return;
+      }
+    } catch {
+      // fall through
+    }
+
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function setStatus(title, detail = '') {
+    document.documentElement.classList.add('md-renderer-active');
+    document.body.classList.add('md-renderer-body');
+
+    document.body.innerHTML = `
+      <main class="md-renderer-shell">
+        <section class="md-renderer-status-card" role="status" aria-live="polite">
+          <h1 class="md-renderer-status-title">${escapeHtml(title)}</h1>
+          <p class="md-renderer-status-detail">${escapeHtml(detail)}</p>
+        </section>
+      </main>
+    `;
   }
 
   function getRawMarkdown() {
@@ -61,304 +446,6 @@
     return document.body.innerText || document.body.textContent || '';
   }
 
-  function escapeHtml(value) {
-    return String(value)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;');
-  }
-
-  function addCss() {
-    GM_addStyle(`
-      :root {
-        color-scheme: light dark;
-      }
-
-      html.md-renderer-active,
-      html.md-renderer-active body {
-        margin: 0;
-        background: Canvas;
-        color: CanvasText;
-      }
-
-      body.md-renderer-body {
-        font-family:
-          -apple-system,
-          BlinkMacSystemFont,
-          "Segoe UI",
-          "Noto Sans JP",
-          "Noto Sans",
-          Helvetica,
-          Arial,
-          sans-serif;
-        line-height: 1.65;
-      }
-
-      .md-renderer-shell {
-        box-sizing: border-box;
-        max-width: ${CONFIG.maxWidth};
-        margin: 0 auto;
-        padding: 32px 20px 72px;
-      }
-
-      .md-renderer-header {
-        display: flex;
-        justify-content: space-between;
-        gap: 16px;
-        align-items: flex-start;
-        margin-bottom: 32px;
-        padding-bottom: 20px;
-        border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
-      }
-
-      .md-renderer-eyebrow {
-        margin-bottom: 4px;
-        color: color-mix(in srgb, CanvasText 58%, transparent);
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      .md-renderer-title {
-        margin: 0;
-        font-size: 24px;
-        line-height: 1.25;
-        word-break: break-word;
-      }
-
-      .md-renderer-button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 34px;
-        padding: 0 12px;
-        border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-        border-radius: 8px;
-        color: CanvasText;
-        text-decoration: none;
-        font-size: 13px;
-        background: color-mix(in srgb, Canvas 92%, CanvasText);
-        cursor: pointer;
-      }
-
-      .md-renderer-button:hover {
-        background: color-mix(in srgb, Canvas 84%, CanvasText);
-      }
-
-      .md-renderer-content {
-        font-size: 16px;
-      }
-
-      .md-renderer-content > :first-child {
-        margin-top: 0;
-      }
-
-      .md-renderer-content > :last-child {
-        margin-bottom: 0;
-      }
-
-      .md-renderer-content h1,
-      .md-renderer-content h2,
-      .md-renderer-content h3,
-      .md-renderer-content h4,
-      .md-renderer-content h5,
-      .md-renderer-content h6 {
-        margin-top: 1.8em;
-        margin-bottom: 0.7em;
-        line-height: 1.25;
-      }
-
-      .md-renderer-content h1 {
-        padding-bottom: 0.3em;
-        border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
-        font-size: 2em;
-      }
-
-      .md-renderer-content h2 {
-        padding-bottom: 0.25em;
-        border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
-        font-size: 1.5em;
-      }
-
-      .md-renderer-content h3 {
-        font-size: 1.25em;
-      }
-
-      .md-renderer-content p,
-      .md-renderer-content ul,
-      .md-renderer-content ol,
-      .md-renderer-content blockquote,
-      .md-renderer-content table,
-      .md-renderer-content pre,
-      .md-renderer-content figure {
-        margin-top: 0;
-        margin-bottom: 1em;
-      }
-
-      .md-renderer-content a {
-        color: LinkText;
-      }
-
-      .md-renderer-content blockquote {
-        padding: 0 1em;
-        color: color-mix(in srgb, CanvasText 68%, transparent);
-        border-left: 4px solid color-mix(in srgb, CanvasText 22%, transparent);
-      }
-
-      .md-renderer-content code {
-        padding: 0.15em 0.35em;
-        border-radius: 5px;
-        background: color-mix(in srgb, CanvasText 9%, transparent);
-        font-family:
-          ui-monospace,
-          SFMono-Regular,
-          SFMono,
-          Consolas,
-          "Liberation Mono",
-          Menlo,
-          monospace;
-        font-size: 0.88em;
-      }
-
-      .md-renderer-content pre {
-        overflow: auto;
-        padding: 16px;
-        border-radius: 10px;
-        background: color-mix(in srgb, CanvasText 8%, transparent);
-      }
-
-      .md-renderer-content pre code {
-        display: block;
-        padding: 0;
-        background: transparent;
-        font-size: 0.9em;
-        white-space: pre;
-      }
-
-      .md-renderer-content table {
-        display: block;
-        width: 100%;
-        overflow: auto;
-        border-collapse: collapse;
-      }
-
-      .md-renderer-content th,
-      .md-renderer-content td {
-        padding: 6px 12px;
-        border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-      }
-
-      .md-renderer-content th {
-        background: color-mix(in srgb, CanvasText 7%, transparent);
-        font-weight: 600;
-      }
-
-      .md-renderer-content hr {
-        height: 1px;
-        margin: 24px 0;
-        border: 0;
-        background: color-mix(in srgb, CanvasText 18%, transparent);
-      }
-
-      .md-renderer-blob-image,
-      .md-renderer-canvas-image {
-        display: block;
-        max-width: 100%;
-        height: auto;
-        border-radius: 8px;
-        background: #fff;
-        box-sizing: border-box;
-        border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
-      }
-
-      .md-renderer-image-figure {
-        display: block;
-        margin: 1.2em 0;
-        max-width: 100%;
-        overflow-x: auto;
-      }
-
-      .md-renderer-image-figure a {
-        display: inline-block;
-        max-width: 100%;
-      }
-
-      .md-renderer-image-figure figcaption {
-        margin-top: 0.5em;
-        color: color-mix(in srgb, CanvasText 68%, transparent);
-        font-size: 0.92em;
-        line-height: 1.45;
-      }
-
-      .md-renderer-image-placeholder {
-        padding: 12px 14px;
-        border: 1px dashed color-mix(in srgb, CanvasText 28%, transparent);
-        border-radius: 8px;
-        color: color-mix(in srgb, CanvasText 72%, transparent);
-        background: color-mix(in srgb, CanvasText 5%, transparent);
-        font-size: 14px;
-      }
-
-      .md-renderer-raw {
-        margin-top: 48px;
-        padding-top: 20px;
-        border-top: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
-      }
-
-      .md-renderer-raw summary {
-        cursor: pointer;
-        font-weight: 700;
-      }
-
-      .md-renderer-raw pre {
-        overflow: auto;
-        margin-top: 12px;
-        padding: 16px;
-        border-radius: 10px;
-        background: color-mix(in srgb, CanvasText 8%, transparent);
-      }
-
-      .md-renderer-math-inline mjx-container {
-        display: inline-block;
-        vertical-align: -0.12em;
-      }
-
-      .md-renderer-math-display {
-        display: block;
-        overflow-x: auto;
-        margin: 1em 0;
-        text-align: center;
-      }
-
-      .md-renderer-math-display mjx-container {
-        display: inline-block;
-        max-width: 100%;
-      }
-
-      .md-renderer-math-error {
-        color: #b00020;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        white-space: pre-wrap;
-      }
-
-      @media (max-width: 640px) {
-        .md-renderer-shell {
-          padding: 20px 14px 56px;
-        }
-
-        .md-renderer-header {
-          flex-direction: column;
-        }
-
-        .md-renderer-title {
-          font-size: 20px;
-        }
-      }
-    `);
-  }
-
   function configureMarked() {
     const renderer = new window.marked.Renderer();
 
@@ -367,6 +454,7 @@
       let title = '';
       let text = '';
 
+      // marked v15 形式: renderer.image(token)
       if (
         hrefOrToken &&
         typeof hrefOrToken === 'object' &&
@@ -376,6 +464,7 @@
         title = hrefOrToken.title || '';
         text = hrefOrToken.text || '';
       } else {
+        // 旧形式互換: renderer.image(href, title, text)
         href = hrefOrToken || '';
         title = titleArg || '';
         text = textArg || '';
@@ -442,7 +531,8 @@
       }
 
       try {
-        const url = new URL(href, location.href);
+        const url = new URL(href, STATE.sourceUrl);
+        a.href = url.href;
 
         if (url.origin !== location.origin) {
           a.target = '_blank';
@@ -454,87 +544,214 @@
     });
   }
 
-  function gmRequestBlob(url) {
+  function getGmXmlHttpRequest() {
+    if (window.GM && typeof window.GM.xmlHttpRequest === 'function') {
+      return window.GM.xmlHttpRequest.bind(window.GM);
+    }
+
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return GM_xmlhttpRequest;
+    }
+
+    return null;
+  }
+
+  function gmXmlHttpRequest(details) {
+    const request = getGmXmlHttpRequest();
+
+    if (!request) {
+      throw new Error('GM.xmlHttpRequest is not available. Use @inject-into content and grant GM.xmlHttpRequest.');
+    }
+
     return new Promise((resolve, reject) => {
-      const request =
-        typeof GM_xmlhttpRequest === 'function'
-          ? GM_xmlhttpRequest
-          : window.GM?.xmlHttpRequest;
+      let settled = false;
 
-      if (!request) {
-        reject(new Error('GM_xmlhttpRequest is not available.'));
-        return;
+      const settleResolve = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      const settleReject = (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error || 'GM request failed')));
+      };
+
+      const requestDetails = {
+        ...details,
+        onload: settleResolve,
+        onerror: settleReject,
+        onabort: () => settleReject(new Error('GM request aborted')),
+        ontimeout: () => settleReject(new Error('GM request timed out')),
+      };
+
+      try {
+        const result = request(requestDetails);
+
+        if (result && typeof result.then === 'function') {
+          result.then(settleResolve, settleReject);
+        }
+      } catch (error) {
+        settleReject(error);
       }
-
-      request({
-        method: 'GET',
-        url,
-        responseType: 'blob',
-        timeout: 30000,
-
-        onload(response) {
-          if (response.status < 200 || response.status >= 300) {
-            reject(new Error(`Image request failed: HTTP ${response.status}`));
-            return;
-          }
-
-          const contentType =
-            /^content-type:\s*([^;\n]+)/im.exec(response.responseHeaders || '')?.[1] ||
-            'application/octet-stream';
-
-          const blob =
-            response.response instanceof Blob
-              ? response.response
-              : new Blob([response.response], { type: contentType });
-
-          resolve(blob);
-        },
-
-        onerror() {
-          reject(new Error('Image request failed.'));
-        },
-
-        ontimeout() {
-          reject(new Error('Image request timed out.'));
-        },
-      });
     });
   }
 
-  function makeImagePlaceholder(message, url) {
-    const div = document.createElement('div');
-    div.className = 'md-renderer-image-placeholder';
+  function getHeader(responseHeaders, name) {
+    const lowerName = name.toLowerCase();
 
-    const text = document.createElement('span');
-    text.textContent = message;
-    div.appendChild(text);
-
-    if (url) {
-      div.appendChild(document.createTextNode(' '));
-
-      const a = document.createElement('a');
-      a.href = url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      a.textContent = 'Open image';
-      div.appendChild(a);
-    }
-
-    return div;
+    return String(responseHeaders || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const index = line.indexOf(':');
+        if (index === -1) return null;
+        return {
+          name: line.slice(0, index).trim().toLowerCase(),
+          value: line.slice(index + 1).trim(),
+        };
+      })
+      .filter(Boolean)
+      .find((header) => header.name === lowerName)?.value || '';
   }
 
-  function makeImageFigure(node, visualElement, absoluteUrl, alt) {
+  function normalizeMimeType(value) {
+    return String(value || '').split(';')[0].trim().toLowerCase();
+  }
+
+  function guessImageMimeType(url) {
+    const pathname = (() => {
+      try {
+        return new URL(url).pathname.toLowerCase();
+      } catch {
+        return String(url).toLowerCase();
+      }
+    })();
+
+    if (pathname.endsWith('.png')) return 'image/png';
+    if (pathname.endsWith('.jpg') || pathname.endsWith('.jpeg')) return 'image/jpeg';
+    if (pathname.endsWith('.gif')) return 'image/gif';
+    if (pathname.endsWith('.webp')) return 'image/webp';
+    if (pathname.endsWith('.avif')) return 'image/avif';
+    if (pathname.endsWith('.svg') || pathname.endsWith('.svgz')) return 'image/svg+xml';
+
+    return '';
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error || new Error('Failed to convert image to data URL'));
+
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function normalizeImageUrl(src) {
+    const url = new URL(src, STATE.sourceUrl);
+
+    if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'data:') {
+      return url.href;
+    }
+
+    throw new Error(`Unsupported image URL scheme: ${url.protocol}`);
+  }
+
+  async function fetchImageBlob(url) {
+    const response = await gmXmlHttpRequest({
+      method: 'GET',
+      url,
+      responseType: 'blob',
+      timeout: CONFIG.imageTimeoutMs,
+      anonymous: true,
+      headers: {
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      },
+    });
+
+    const status = Number(response.status || 0);
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`HTTP ${status || 'unknown'}`);
+    }
+
+    let blob = response.response;
+
+    if (!(blob instanceof Blob)) {
+      if (typeof response.responseText === 'string') {
+        const contentType = normalizeMimeType(getHeader(response.responseHeaders, 'content-type')) || 'application/octet-stream';
+        blob = new Blob([response.responseText], { type: contentType });
+      } else {
+        throw new Error('Response is not a Blob');
+      }
+    }
+
+    if (blob.size > CONFIG.maxImageBytes) {
+      throw new Error(`Image is too large: ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
+    }
+
+    const headerMimeType = normalizeMimeType(getHeader(response.responseHeaders, 'content-type'));
+    const blobMimeType = normalizeMimeType(blob.type);
+    const guessedMimeType = guessImageMimeType(url);
+    const mimeType = blobMimeType || headerMimeType || guessedMimeType;
+
+    if (!mimeType.startsWith('image/')) {
+      throw new Error(`Response is not an image: ${mimeType || 'unknown content-type'}`);
+    }
+
+    if (!CONFIG.allowSvgImageEmbedding && mimeType === 'image/svg+xml') {
+      throw new Error('SVG embedding is disabled');
+    }
+
+    if (blob.type !== mimeType) {
+      blob = blob.slice(0, blob.size, mimeType);
+    }
+
+    return blob;
+  }
+
+  async function imageUrlToDataUrl(url) {
+    if (url.startsWith('data:')) {
+      if (!url.startsWith('data:image/')) {
+        throw new Error('Only data:image/... URLs are allowed for images');
+      }
+
+      return url;
+    }
+
+    const blob = await fetchImageBlob(url);
+    return await blobToDataUrl(blob);
+  }
+
+  function createImageFigure({ originalUrl, imageSrc, alt, title, embedded, error }) {
     const figure = document.createElement('figure');
     figure.className = 'md-renderer-image-figure';
 
     const link = document.createElement('a');
-    link.href = absoluteUrl;
+    link.href = originalUrl;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
-    link.style.display = 'inline-block';
-    link.style.maxWidth = '100%';
 
-    link.appendChild(visualElement);
+    const image = document.createElement('img');
+    image.className = 'md-renderer-blob-image';
+    image.alt = alt;
+    image.title = title || alt;
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
+    image.src = imageSrc;
+
+    if (embedded) {
+      image.dataset.mdRendererEmbedded = 'true';
+    } else {
+      image.dataset.mdRendererEmbedded = 'false';
+    }
+
+    link.appendChild(image);
     figure.appendChild(link);
 
     if (alt) {
@@ -543,191 +760,107 @@
       figure.appendChild(figcaption);
     }
 
-    node.replaceWith(figure);
+    if (error) {
+      const note = document.createElement('div');
+      note.className = 'md-renderer-image-note';
+      note.textContent = `Image was not embedded; falling back to external URL. ${error.message || String(error)}`;
+      figure.appendChild(note);
+    }
 
     return figure;
   }
 
-  async function decodeImageBlob(blob) {
-    if (window.createImageBitmap) {
-      return await createImageBitmap(blob);
-    }
+  async function mapLimit(items, limit, worker) {
+    let index = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
 
-    return await new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
-      const image = new Image();
-
-      image.onload = () => {
-        URL.revokeObjectURL(objectUrl);
-        resolve(image);
-      };
-
-      image.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error('Image decode failed.'));
-      };
-
-      image.src = objectUrl;
-    });
-  }
-
-  // 👇ここが今回のメインの改造ポイント！ Object URLをヤメてBase64変換に変更したよ！👇
-  function renderBase64Image(placeholder, blob, absoluteUrl, alt, title) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-
-      reader.onloadend = () => {
-        const base64data = reader.result;
-
-        const image = document.createElement('img');
-        image.className = 'md-renderer-blob-image'; // クラス名は元のまま流用！
-        image.alt = alt || '';
-        image.title = title || alt || '';
-        image.loading = 'lazy';
-        image.decoding = 'async';
-        image.style.background = CONFIG.imageCanvasBackground || '#ffffff';
-
-        image.onload = () => {
-          makeImageFigure(placeholder, image, absoluteUrl, alt);
-
-          console.info('[md-renderer] image rendered via base64:', {
-            url: absoluteUrl,
-            naturalWidth: image.naturalWidth,
-            naturalHeight: image.naturalHeight,
-            connected: image.isConnected,
-          });
-
-          resolve(true);
-        };
-
-        image.onerror = () => {
-          reject(new Error('Base64 URL image rendering failed or was blocked by CSP.'));
-        };
-
-        image.src = base64data; // 変換したBase64データを直接srcにぶち込む！
-      };
-
-      reader.onerror = () => {
-        reject(new Error('Blob to Base64 conversion failed.'));
-      };
-
-      // BlobをBase64に変換スタート！
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  async function renderCanvasImage(placeholder, blob, absoluteUrl, alt, title) {
-    const bitmap = await decodeImageBlob(blob);
-
-    const canvas = document.createElement('canvas');
-    canvas.className = 'md-renderer-canvas-image';
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.title = title || alt || '';
-
-    canvas.style.display = 'block';
-    canvas.style.width = `${bitmap.width}px`;
-    canvas.style.maxWidth = '100%';
-    canvas.style.height = 'auto';
-    canvas.style.background = CONFIG.imageCanvasBackground || '#ffffff';
-
-    const figure = makeImageFigure(placeholder, canvas, absoluteUrl, alt);
-
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-
-    const context = canvas.getContext('2d', {
-      alpha: false,
-      willReadFrequently: true,
-    });
-
-    context.save();
-    context.fillStyle = CONFIG.imageCanvasBackground || '#ffffff';
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.restore();
-
-    context.drawImage(bitmap, 0, 0);
-
-    let sample = null;
-
-    try {
-      sample = Array.from(
-        context.getImageData(
-          Math.floor(canvas.width / 2),
-          Math.floor(canvas.height / 2),
-          1,
-          1
-        ).data
-      );
-    } catch {
-      sample = 'unavailable';
-    }
-
-    console.info('[md-renderer] image rendered via canvas:', {
-      url: absoluteUrl,
-      width: bitmap.width,
-      height: bitmap.height,
-      connected: canvas.isConnected,
-      figureConnected: figure.isConnected,
-      samplePixelAtCenter: sample,
-    });
-  }
-
-  async function replaceImageRequestWithRenderableImage(requestNode, absoluteUrl, alt, title) {
-    if (requestNode.dataset.mdRendererProxyStarted === '1') return;
-    requestNode.dataset.mdRendererProxyStarted = '1';
-
-    const placeholder = makeImagePlaceholder(
-      'Loading image through userscript...',
-      absoluteUrl
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (index < items.length) {
+          const currentIndex = index;
+          index++;
+          await worker(items[currentIndex], currentIndex);
+        }
+      })
     );
+  }
 
-    requestNode.replaceWith(placeholder);
+  async function postProcessImages(root) {
+    const nodes = [...root.querySelectorAll('.md-renderer-image-request[data-md-image-src]')];
 
-    try {
-      const blob = await gmRequestBlob(absoluteUrl);
+    if (!nodes.length) return;
+
+    let completed = 0;
+    let embeddedCount = 0;
+    let fallbackCount = 0;
+
+    const updateProgress = () => {
+      setStatus(
+        'Embedding images...',
+        `${completed}/${nodes.length} processed, ${embeddedCount} embedded, ${fallbackCount} fallback.`
+      );
+    };
+
+    updateProgress();
+
+    await mapLimit(nodes, CONFIG.imageConcurrency, async (node) => {
+      const src = node.getAttribute('data-md-image-src') || '';
+      const alt = node.getAttribute('data-md-image-alt') || '';
+      const title = node.getAttribute('data-md-image-title') || '';
+
+      let originalUrl;
 
       try {
-        // 👇元の renderBlobImage の代わりに Base64 版を呼び出すように変更！👇
-        await renderBase64Image(placeholder, blob, absoluteUrl, alt, title);
+        originalUrl = normalizeImageUrl(src);
+      } catch (error) {
+        const fallback = document.createElement('span');
+        fallback.textContent = alt || src;
+        node.replaceWith(fallback);
+
+        completed++;
+        fallbackCount++;
+        updateProgress();
         return;
-      } catch (b64Error) {
-        console.warn(
-          '[md-renderer] base64 img failed; falling back to canvas:',
-          absoluteUrl,
-          b64Error
-        );
       }
 
-      await renderCanvasImage(placeholder, blob, absoluteUrl, alt, title);
-    } catch (error) {
-      console.warn('[md-renderer] image rendering failed:', absoluteUrl, error);
+      let imageSrc = originalUrl;
+      let embedded = false;
+      let error = null;
 
-      const failed = makeImagePlaceholder('Image could not be rendered.', absoluteUrl);
-      placeholder.replaceWith(failed);
-    }
-  }
-
-  function postProcessImages(root) {
-    root
-      .querySelectorAll('.md-renderer-image-request[data-md-image-src]')
-      .forEach((node) => {
-        const src = node.getAttribute('data-md-image-src') || '';
-        const alt = node.getAttribute('data-md-image-alt') || '';
-        const title = node.getAttribute('data-md-image-title') || '';
-
-        let absoluteUrl;
-
+      if (CONFIG.embedImagesAsDataUrls) {
         try {
-          absoluteUrl = new URL(src, location.href).href;
-        } catch {
-          const failed = makeImagePlaceholder('Invalid image URL.', src);
-          node.replaceWith(failed);
-          return;
+          imageSrc = await imageUrlToDataUrl(originalUrl);
+          embedded = true;
+          embeddedCount++;
+        } catch (caught) {
+          error = caught;
+          fallbackCount++;
+          console.warn('[md-renderer] image embedding failed:', originalUrl, caught);
         }
+      }
 
-        replaceImageRequestWithRenderableImage(node, absoluteUrl, alt, title);
+      const figure = createImageFigure({
+        originalUrl,
+        imageSrc,
+        alt,
+        title,
+        embedded,
+        error,
       });
+
+      node.replaceWith(figure);
+      completed++;
+      updateProgress();
+    });
+
+    console.info(
+      `[md-renderer] image processing finished: ${embeddedCount} embedded, ${fallbackCount} fallback(s)`
+    );
   }
+
+  // ---------------------------------------------------------------------------
+  // 数式レンダリング
+  // ---------------------------------------------------------------------------
 
   function shouldSkipMathNode(node) {
     const parent = node.parentElement;
@@ -867,7 +1000,7 @@
       const css = style?.textContent || style?.innerHTML || '';
 
       if (css) {
-        GM_addStyle(css);
+        STATE.mathJaxCss = css;
       }
     }
   }
@@ -900,6 +1033,10 @@
 
     const textNodes = collectTextNodesForMath(root);
     let count = 0;
+
+    if (textNodes.length) {
+      setStatus('Rendering math...', `${textNodes.length} text node(s) may contain TeX.`);
+    }
 
     for (const textNode of textNodes) {
       const text = textNode.nodeValue || '';
@@ -938,60 +1075,94 @@
     console.info(`[md-renderer] MathJax SVG rendered: ${count} expression(s)`);
   }
 
+  // ---------------------------------------------------------------------------
+  // Standalone HTML
+  // ---------------------------------------------------------------------------
+
+  function buildStandaloneHtml({ contentHtml, rawMarkdown }) {
+    const title = `Markdown: ${STATE.sourceTitle}`;
+    const css = `${APP_CSS}\n${STATE.mathJaxCss || ''}`;
+
+    return `<!doctype html>
+<html class="md-renderer-active">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob: http: https:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>${escapeHtml(title)}</title>
+  <style>${css}</style>
+</head>
+<body class="md-renderer-body">
+  <main class="md-renderer-shell">
+    <header class="md-renderer-header">
+      <div>
+        <div class="md-renderer-eyebrow">Rendered Markdown</div>
+        <h1 class="md-renderer-title">${escapeHtml(STATE.sourceTitle)}</h1>
+      </div>
+      <nav class="md-renderer-actions" aria-label="Document actions">
+        <a class="md-renderer-button" href="${escapeHtml(STATE.sourceUrl)}" target="_blank" rel="noopener noreferrer">Open Raw</a>
+      </nav>
+    </header>
+
+    <article class="md-renderer-content">
+      ${contentHtml}
+    </article>
+
+    <details class="md-renderer-raw">
+      <summary>Raw Markdown</summary>
+      <pre><code>${escapeHtml(rawMarkdown)}</code></pre>
+    </details>
+  </main>
+</body>
+</html>`;
+  }
+
+  function openStandaloneHtml(html) {
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const blobUrl = URL.createObjectURL(blob);
+
+    location.replace(blobUrl);
+  }
+
   async function renderPage(markdown) {
     configureMarked();
+
+    setStatus('Parsing Markdown...', STATE.sourceUrl);
 
     const rawHtml = window.marked.parse(markdown);
     const safeHtml = sanitizeHtml(rawHtml);
 
-    const fileName = decodeURIComponent(
-      location.pathname.split('/').pop() || 'Markdown'
-    );
+    const container = document.createElement('article');
+    container.className = 'md-renderer-content';
+    container.innerHTML = safeHtml;
 
-    document.title = `Markdown: ${fileName}`;
-    document.documentElement.classList.add('md-renderer-active');
-    document.body.classList.add('md-renderer-body');
+    postProcessLinks(container);
+    await postProcessImages(container);
+    await renderMath(container);
 
-    document.body.innerHTML = `
-      <main class="md-renderer-shell">
-        <header class="md-renderer-header">
-          <div>
-            <div class="md-renderer-eyebrow">Rendered Markdown</div>
-            <h1 class="md-renderer-title">${escapeHtml(fileName)}</h1>
-          </div>
-          <button type="button" class="md-renderer-button" id="md-renderer-toggle-raw">
-            Toggle Raw
-          </button>
-        </header>
+    setStatus('Opening rendered document...', 'Switching to a standalone blob HTML document.');
 
-        <article id="md-renderer-content" class="md-renderer-content">
-          ${safeHtml}
-        </article>
-
-        <details class="md-renderer-raw" id="md-renderer-raw">
-          <summary>Raw Markdown</summary>
-          <pre><code>${escapeHtml(markdown)}</code></pre>
-        </details>
-      </main>
-    `;
-
-    const contentRoot = document.getElementById('md-renderer-content');
-    const rawDetails = document.getElementById('md-renderer-raw');
-    const toggleRaw = document.getElementById('md-renderer-toggle-raw');
-
-    postProcessLinks(contentRoot);
-    postProcessImages(contentRoot);
-    await renderMath(contentRoot);
-
-    toggleRaw.addEventListener('click', () => {
-      rawDetails.open = !rawDetails.open;
+    const standaloneHtml = buildStandaloneHtml({
+      contentHtml: container.innerHTML,
+      rawMarkdown: markdown,
     });
 
-    console.info('[md-renderer] rendered successfully');
+    openStandaloneHtml(standaloneHtml);
+
+    console.info('[md-renderer] rendered successfully (Safari standalone edition)');
   }
 
   async function main() {
+    const markdown = getRawMarkdown();
+
+    addStyle(APP_CSS);
+
     if (!hasRequiredLibraries()) {
+      setStatus(
+        'Markdown Renderer failed',
+        'Required libraries are missing: marked, DOMPurify, or MathJax.'
+      );
+
       console.error('[md-renderer] Required libraries are missing.', {
         marked: !!window.marked,
         DOMPurify: !!window.DOMPurify,
@@ -1000,18 +1171,18 @@
       return;
     }
 
-    const markdown = getRawMarkdown();
-
     if (!markdown.trim()) {
+      setStatus('Markdown Renderer skipped', 'Markdown body is empty.');
       console.warn('[md-renderer] Markdown body is empty.');
       return;
     }
 
-    addCss();
     await renderPage(markdown);
   }
 
   main().catch((error) => {
+    addStyle(APP_CSS);
+    setStatus('Markdown Renderer failed', error?.message || String(error));
     console.error('[md-renderer] Fatal error:', error);
   });
 })();
