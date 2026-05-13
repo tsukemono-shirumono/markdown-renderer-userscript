@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Markdown Renderer (Safari)
 // @namespace    https://example.local/userscripts
-// @version      0.9.1
+// @version      0.9.2
 // @description  Render raw .md URLs as standalone HTML on Safari/iPad. Embeds external images as Base64 data URLs before opening a blob HTML document.
 // @author       you
 // @match        http://*/*.md*
@@ -43,7 +43,9 @@
     imageTimeoutMs: 30000,
 
     // Userscripts 側の通信が返ってこない場合に備えた追加タイムアウト。
-    hardTimeoutE([github.com](https://github.com/quoid/userscripts?utm_source=chatgpt.com))  // 画像取得ログを Safari Web Inspector の Console に出す。
+    hardTimeoutExtraMs: 5000,
+
+    // 画像取得ログを Safari Web Inspector の Console に出す。
     debugImageRequests: true,
 
     // SVG は data URL 化して <img> 表示するだけなら通常スクリプト実行されないが、
